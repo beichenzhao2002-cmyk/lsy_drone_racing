@@ -23,6 +23,7 @@ from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.control import Controller
+from lsy_drone_racing.control.level3_clearance import add_soft_clearance
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -53,7 +54,8 @@ def create_acados_model(parameters: dict) -> AcadosModel:
 
 
 def create_ocp_solver(
-    Tf: float, N: int, parameters: dict, verbose: bool = False
+    Tf: float, N: int, parameters: dict, verbose: bool = False, *, racing: bool = False,
+    tilt_limit: float = 0.50, soft_obstacle_clearance: bool = False,
 ) -> tuple[AcadosOcpSolver, AcadosOcp]:
     """Creates an acados Optimal Control Problem and Solver."""
     ocp = AcadosOcp()
@@ -107,6 +109,9 @@ def create_ocp_solver(
         ]
     )
 
+    if racing:
+        Q = np.diag([180., 180., 480., 2., 2., 2., 14., 14., 16., 2., 2., 2.])
+        R = np.diag([1., 1., 1., 30.])
     Q_e = Q.copy()
     ocp.cost.W = scipy.linalg.block_diag(Q, R)
     ocp.cost.W_e = Q_e
@@ -127,15 +132,22 @@ def create_ocp_solver(
     ocp.cost.yref, ocp.cost.yref_e = np.zeros((ny,)), np.zeros((ny_e,))
 
     # Set State Constraints (rpy < 30°)
-    ocp.constraints.lbx = np.array([-0.5, -0.5, -0.5])
-    ocp.constraints.ubx = np.array([0.5, 0.5, 0.5])
+    ocp.constraints.lbx = np.array([-tilt_limit, -tilt_limit, -0.5])
+    ocp.constraints.ubx = np.array([tilt_limit, tilt_limit, 0.5])
     ocp.constraints.idxbx = np.array([3, 4, 5])
+    if racing:
+        # Keep hard input limits, but permit recovering after an observed tilt excursion.
+        ocp.constraints.idxsbx = np.arange(3)
+        ocp.cost.zl = ocp.cost.zu = np.full(3, 40.)
+        ocp.cost.Zl = ocp.cost.Zu = np.full(3, 200.)
+        if soft_obstacle_clearance:
+            add_soft_clearance(ocp, nx, nu)
 
     # Set Input Constraints (rpy < 30°)
     total_thrust_min = parameters["thrust_min"] * 4
     total_thrust_max = parameters["thrust_max"] * 4
-    ocp.constraints.lbu = np.array([-0.5, -0.5, -0.5, total_thrust_min])
-    ocp.constraints.ubu = np.array([0.5, 0.5, 0.5, total_thrust_max])
+    ocp.constraints.lbu = np.array([-tilt_limit, -tilt_limit, -0.5, total_thrust_min])
+    ocp.constraints.ubu = np.array([tilt_limit, tilt_limit, 0.5, total_thrust_max])
     ocp.constraints.idxbu = np.array([0, 1, 2, 3])
 
     # We have to set x0 even though we will overwrite it later on.
@@ -179,6 +191,8 @@ def create_ocp_solver(
 class AttitudeMPC(Controller):
     """Example of a MPC using the collective thrust and attitude interface."""
 
+    racing_tracking = False
+
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
         """Initialize the attitude controller.
 
@@ -192,6 +206,9 @@ class AttitudeMPC(Controller):
         self._N = 25
         self._dt = 1 / config.env.freq
         self._T_HORIZON = self._N * self._dt
+        if self.racing_tracking:
+            self._T_HORIZON = config.controller.get("prediction_seconds", self._T_HORIZON)
+        self._prediction_dt = self._T_HORIZON / self._N
 
         # Same waypoints as in the state controller. Determined by trial and error.
         start_pos = obs["pos"]
@@ -224,8 +241,13 @@ class AttitudeMPC(Controller):
         self._waypoints_yaw = self._waypoints_pos[:, 0] * 0
 
         self.drone_params = load_params(Dynamics.so_rpy, config.sim.drone)
+        self._soft_obstacle_clearance = self.racing_tracking and config.controller.get(
+            "soft_obstacle_clearance", False,
+        )
         self._acados_ocp_solver, self._ocp = create_ocp_solver(
-            self._T_HORIZON, self._N, self.drone_params
+            self._T_HORIZON, self._N, self.drone_params, racing=self.racing_tracking,
+            tilt_limit=config.controller.get("mpc_tilt_limit", 0.50) if self.racing_tracking else 0.50,
+            soft_obstacle_clearance=self._soft_obstacle_clearance,
         )
         self._nx = self._ocp.model.x.rows()
         self._nu = self._ocp.model.u.rows()
@@ -255,42 +277,41 @@ class AttitudeMPC(Controller):
         if self._tick >= self._tick_max:
             self._finished = True
 
-        # Setting initial state
-        obs["rpy"] = R.from_quat(obs["quat"]).as_euler("xyz")
-        obs["drpy"] = ang_vel2rpy_rates(obs["quat"], obs["ang_vel"])
-        x0 = np.concatenate((obs["pos"], obs["rpy"], obs["vel"], obs["drpy"]))
-        self._acados_ocp_solver.set(0, "lbx", x0)
-        self._acados_ocp_solver.set(0, "ubx", x0)
+        horizon = slice(i, i + self._N + 1)
+        return self.track_reference(
+            obs, self._waypoints_pos[horizon], self._waypoints_vel[horizon],
+            yaw=self._waypoints_yaw[horizon],
+        )
 
-        # Setting state reference
-        yref = np.zeros((self._N, self._ny))
-        yref[:, 0:3] = self._waypoints_pos[i : i + self._N]  # position
-        # zero roll, pitch
-        yref[:, 5] = self._waypoints_yaw[i : i + self._N]  # yaw
-        yref[:, 6:9] = self._waypoints_vel[i : i + self._N]  # velocity
-        # zero drpy
+    def track_reference(self, obs, position, velocity, acceleration=None, yaw=0.0):
+        """Track an external horizon with optional acceleration feedforward."""
+        rpy = R.from_quat(obs["quat"]).as_euler("xyz")
+        rates = ang_vel2rpy_rates(obs["quat"], obs["ang_vel"])
+        state = np.concatenate((obs["pos"], rpy, obs["vel"], rates))
+        solver = self._acados_ocp_solver
+        solver.set(0, "lbx", state)
+        solver.set(0, "ubx", state)
 
-        # Setting input reference (index > self._nx)
-        # zero rpy
-        # hover thrust
-        yref[:, 15] = self.drone_params["mass"] * -self.drone_params["gravity_vec"][-1]
-        for j in range(self._N):
-            self._acados_ocp_solver.set(j, "yref", yref[j])
+        reference = np.zeros((self._N + 1, self._ny))
+        reference[:, :3] = position
+        reference[:, 5] = yaw
+        reference[:, 6:9] = velocity
+        mass = self.drone_params["mass"]
+        gravity = self.drone_params["gravity_vec"]
+        reference[:, 15] = mass * -gravity[-1]
+        if acceleration is not None:
+            force = mass * (acceleration - gravity)
+            thrust = np.maximum(np.linalg.norm(force, axis=1), 1e-6)
+            reference[:, 3] = -np.arcsin(np.clip(force[:, 1] / thrust, -1.0, 1.0))
+            reference[:, 4] = np.arctan2(force[:, 0], force[:, 2])
+            reference[:, 12:15] = reference[:, 3:6]
+            reference[:, 15] = thrust
 
-        # Setting final state reference
-        yref_e = np.zeros((self._ny_e))
-        yref_e[0:3] = self._waypoints_pos[i + self._N]  # position
-        # zero roll, pitch
-        yref_e[5] = self._waypoints_yaw[i + self._N]  # yaw
-        yref_e[6:9] = self._waypoints_vel[i + self._N]  # velocity
-        # zero drpy
-        self._acados_ocp_solver.set(self._N, "y_ref", yref_e)
-
-        # Solving problem and getting first input
-        self._acados_ocp_solver.solve()
-        u0 = self._acados_ocp_solver.get(0, "u")
-
-        return u0
+        for stage in range(self._N):
+            solver.set(stage, "yref", reference[stage])
+        solver.set(self._N, "yref", reference[-1, :self._ny_e])
+        self.solver_status = solver.solve()
+        return solver.get(0, "u")
 
     def step_callback(
         self,
