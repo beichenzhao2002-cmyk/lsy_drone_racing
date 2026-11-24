@@ -16,6 +16,7 @@ import numpy as np
 import scipy
 from acados_template import AcadosModel, AcadosOcp, AcadosOcpSolver
 from acados_template.builders import ocp_get_default_cmake_builder
+from casadi import cos
 from crazyflow.dynamics import Dynamics, load_params
 from crazyflow.dynamics.so_rpy import symbolic_dynamics_euler
 from crazyflow.dynamics.utils.rotation import ang_vel2rpy_rates
@@ -26,6 +27,8 @@ from lsy_drone_racing.control import Controller
 from lsy_drone_racing.control.level3_clearance import add_soft_clearance
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from numpy.typing import NDArray
 
 
@@ -56,12 +59,24 @@ def create_acados_model(parameters: dict) -> AcadosModel:
 def create_ocp_solver(
     Tf: float, N: int, parameters: dict, verbose: bool = False, *, racing: bool = False,
     tilt_limit: float = 0.50, soft_obstacle_clearance: bool = False,
+    combined_tilt_limit: bool = False, constraint_curvature: bool = False,
+    initial_command_constraint: bool = False, clearance_plane_count: int = 2,
+    model_factory: Callable[[dict], AcadosModel] | None = None,
+    configure: Callable[[AcadosOcp], None] | None = None,
 ) -> tuple[AcadosOcpSolver, AcadosOcp]:
-    """Creates an acados Optimal Control Problem and Solver."""
+    """Create the solver with opt-in constraint curvature and initial command bounds.
+
+    Legacy settings remain the default. The initial command option copies the
+    combined command cone to stage zero without constraining the measured state.
+    """
+    if initial_command_constraint and not constraint_curvature:
+        raise ValueError("Initial command constraint requires constraint curvature")
+    if constraint_curvature and not combined_tilt_limit:
+        raise ValueError("Constraint curvature requires the combined tilt model")
     ocp = AcadosOcp()
 
     # Set model
-    ocp.model = create_acados_model(parameters)
+    ocp.model = (model_factory or create_acados_model)(parameters)
 
     # Get Dimensions
     nx = ocp.model.x.rows()
@@ -141,7 +156,10 @@ def create_ocp_solver(
         ocp.cost.zl = ocp.cost.zu = np.full(3, 40.)
         ocp.cost.Zl = ocp.cost.Zu = np.full(3, 200.)
         if soft_obstacle_clearance:
-            add_soft_clearance(ocp, nx, nu)
+            if clearance_plane_count == 2:
+                add_soft_clearance(ocp, nx, nu)
+            else:
+                add_soft_clearance(ocp, nx, nu, plane_count=clearance_plane_count)
 
     # Set Input Constraints (rpy < 30°)
     total_thrust_min = parameters["thrust_min"] * 4
@@ -150,12 +168,33 @@ def create_ocp_solver(
     ocp.constraints.ubu = np.array([tilt_limit, tilt_limit, 0.5, total_thrust_max])
     ocp.constraints.idxbu = np.array([0, 1, 2, 3])
 
+    if combined_tilt_limit:
+        # Bound combined commanded tilt; actual attitude can still overshoot.
+        # Include simultaneous roll and pitch commands in this cone.
+        roll, pitch = ocp.model.u[0], ocp.model.u[1]
+        ocp.model.con_h_expr = cos(roll) * cos(pitch)
+        ocp.constraints.lh = np.array([np.cos(tilt_limit)])
+        # The cosine upper bound is redundant. Leaving it active at level
+        # attitude makes the constraint Hessian numerically degenerate.
+        ocp.constraints.uh = np.array([1000.0 if constraint_curvature else 1.0])
+        if initial_command_constraint:
+            # Also constrain the command that will actually be executed.
+            # Acados does not copy path nonlinear constraints to stage zero.
+            ocp.model.con_h_expr_0 = ocp.model.con_h_expr
+            ocp.constraints.lh_0 = ocp.constraints.lh.copy()
+            ocp.constraints.uh_0 = ocp.constraints.uh.copy()
+
     # We have to set x0 even though we will overwrite it later on.
     ocp.constraints.x0 = np.zeros((nx))
 
     # Solver Options
     ocp.solver_options.qp_solver = "FULL_CONDENSING_HPIPM"  # FULL_, PARTIAL_ ,_HPIPM, _QPOASES
-    ocp.solver_options.hessian_approx = "GAUSS_NEWTON"
+    if constraint_curvature:
+        ocp.solver_options.hessian_approx = "EXACT"
+        ocp.solver_options.exact_hess_dyn = 0
+        ocp.solver_options.exact_hess_constr = 1
+    else:
+        ocp.solver_options.hessian_approx = "GAUSS_NEWTON"
     ocp.solver_options.integrator_type = "ERK"
     ocp.solver_options.nlp_solver_type = "SQP"  # SQP, SQP_RTI
     ocp.solver_options.tol = 1e-6
@@ -176,6 +215,9 @@ def create_ocp_solver(
         cmake_builder.generator = "MinGW Makefiles"
         cmake_builder.build_dir = "build-mingw"
 
+    if configure is not None:
+        configure(ocp)
+
     acados_ocp_solver = AcadosOcpSolver(
         ocp,
         json_file="c_generated_code/lsy_example_mpc.json",
@@ -192,6 +234,12 @@ class AttitudeMPC(Controller):
     """Example of a MPC using the collective thrust and attitude interface."""
 
     racing_tracking = False
+    combined_tilt_limit = False
+    constraint_curvature = False
+    initial_command_constraint = False
+    _clearance_plane_count = 2
+    _prediction_model_factory = None
+    _configure_prediction_ocp = None
 
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
         """Initialize the attitude controller.
@@ -241,13 +289,28 @@ class AttitudeMPC(Controller):
         self._waypoints_yaw = self._waypoints_pos[:, 0] * 0
 
         self.drone_params = load_params(Dynamics.so_rpy, config.sim.drone)
+        if self.racing_tracking and "mpc_thrust_fraction" in config.controller:
+            fraction = config.controller.mpc_thrust_fraction
+            thrust_max = self.drone_params["thrust_max"] * fraction
+            hover_thrust = -self.drone_params["mass"] * self.drone_params["gravity_vec"][2]
+            if not 0.0 < fraction <= 1.0 or 4 * thrust_max <= hover_thrust:
+                raise ValueError("MPC collective thrust limit must exceed hover thrust")
+            self.drone_params = dict(self.drone_params, thrust_max=thrust_max)
         self._soft_obstacle_clearance = self.racing_tracking and config.controller.get(
             "soft_obstacle_clearance", False,
         )
         self._acados_ocp_solver, self._ocp = create_ocp_solver(
             self._T_HORIZON, self._N, self.drone_params, racing=self.racing_tracking,
-            tilt_limit=config.controller.get("mpc_tilt_limit", 0.50) if self.racing_tracking else 0.50,
+            tilt_limit=(
+                config.controller.get("mpc_tilt_limit", 0.50) if self.racing_tracking else 0.50
+            ),
             soft_obstacle_clearance=self._soft_obstacle_clearance,
+            combined_tilt_limit=self.combined_tilt_limit,
+            constraint_curvature=self.constraint_curvature,
+            initial_command_constraint=self.initial_command_constraint,
+            clearance_plane_count=self._clearance_plane_count,
+            model_factory=self._prediction_model_factory,
+            configure=self._configure_prediction_ocp,
         )
         self._nx = self._ocp.model.x.rows()
         self._nu = self._ocp.model.u.rows()
@@ -283,7 +346,14 @@ class AttitudeMPC(Controller):
             yaw=self._waypoints_yaw[horizon],
         )
 
-    def track_reference(self, obs, position, velocity, acceleration=None, yaw=0.0):
+    def track_reference(
+        self,
+        obs: dict[str, NDArray[np.floating]],
+        position: NDArray[np.floating],
+        velocity: NDArray[np.floating],
+        acceleration: NDArray[np.floating] | None = None,
+        yaw: float = 0.0,
+    ) -> NDArray[np.floating]:
         """Track an external horizon with optional acceleration feedforward."""
         rpy = R.from_quat(obs["quat"]).as_euler("xyz")
         rates = ang_vel2rpy_rates(obs["quat"], obs["ang_vel"])
@@ -307,11 +377,22 @@ class AttitudeMPC(Controller):
             reference[:, 12:15] = reference[:, 3:6]
             reference[:, 15] = thrust
 
+        reference = self._prepare_tracking_reference(reference, acceleration)
         for stage in range(self._N):
             solver.set(stage, "yref", reference[stage])
         solver.set(self._N, "yref", reference[-1, :self._ny_e])
         self.solver_status = solver.solve()
         return solver.get(0, "u")
+
+    def _prepare_tracking_reference(
+        self, reference: np.ndarray, acceleration: np.ndarray | None
+    ) -> np.ndarray:
+        """Optional model-specific reference mapping; preserve the default reference."""
+        return reference
+
+    def model_parameters(self) -> np.ndarray:
+        """Runtime model parameters, empty for the original identified model."""
+        return np.zeros(int(self._ocp.model.p.numel()))
 
     def step_callback(
         self,

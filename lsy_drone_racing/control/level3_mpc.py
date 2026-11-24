@@ -315,6 +315,13 @@ def plan_remaining_race(obs, settings):
     open_limit = settings.get("open_lateral_acceleration", 0.)
     open_turn = (obs, open_limit) if progress > 0 and open_limit > settings["lateral_acceleration"] else None
 
+    finish_runout = settings.get("finish_runout", 0.0)
+    final_gate = int(obs["gate_sequence"][-1])
+    extend_finish = (
+        finish_runout > 0
+        and progress == len(obs["gate_sequence"]) - 1
+        and obs["gates_visited"][final_gate]
+    )
     timing = {
         "acceleration_budget": settings.get("acceleration_budget"),
         "vector_speed_profile": settings.get("vector_speed_profile", False),
@@ -328,6 +335,16 @@ def plan_remaining_race(obs, settings):
             alignment, offset, short_alignment, slope,
             settings.get("local_endpoint_clearance", False), minimal,
         )
+        if extend_finish:
+            # Keep the crossing direction and reserve space to brake after the gate.
+            end = points[-1] + finish_runout * headings[-1]
+            extension = np.linspace(points[-1], end, 9)
+            if (
+                np.all(extension >= [-2.40, -1.40, 0.10])
+                and np.all(extension <= [2.40, 1.40, 1.90])
+                and np.min(obstacle_distances(extension, obs)) >= 0.15
+            ):
+                points[-1] = end
         arguments = (
             points, headings, obs["vel"], settings["cruise_speed"] * speed_scale,
             settings["acceleration"] * speed_scale, settings["lateral_acceleration"],
@@ -724,7 +741,16 @@ class Level3MPC(AttitudeMPC):
                 along = residual @ tangent
                 cross_track = np.linalg.norm(residual - along * tangent)
                 # Let the MPC recover small along-track lags in open sections.
-                error = np.hypot(cross_track, min(along + 0.16, 0.0))
+                lag_allowance = settings.get("open_tracking_lag", 0.16)
+                transition = settings.get("open_tracking_transition", 0.0)
+                if transition > 0.0:
+                    clearance = min(gate_distance - 0.70, pole_distances.min(initial=np.inf) - 0.55)
+                    blend = min(clearance / transition, 1.0)
+                    blend = blend * blend * (3.0 - 2.0 * blend)
+                    recovery_error = np.hypot(cross_track, min(along + lag_allowance, 0.0))
+                    error += blend * (recovery_error - error)
+                else:
+                    error = np.hypot(cross_track, min(along + lag_allowance, 0.0))
                 clock_rate = np.clip(1.0 - 2.5 * max(0.0, error - 0.10), 0.4, 1.0)
         times = self._reference_time + np.arange(self._N + 1) * self._prediction_dt * clock_rate
         self._reference_time += self._dt * clock_rate
@@ -742,7 +768,10 @@ class Level3MPC(AttitudeMPC):
         if self.solver_status not in (0, 2) or not np.isfinite(action).all():
             self.solve_failures += 1
             return self._last_command
-        # Blend the MPC thrust with vertical feedback using the observed attitude.
+        obs, position, velocity, acceleration = self._feedback_reference(
+            obs, position, velocity, acceleration
+        )
+        # Blend the MPC thrust with vertical feedback using the tracking attitude.
         # This compensates for thrust/model mismatch under the randomized mass.
         if settings.get("altitude_feedback", False):
             mass = self.drone_params["mass"]
@@ -757,6 +786,12 @@ class Level3MPC(AttitudeMPC):
             self.center_on_gate(obs, progress, action, predictive)
         self._last_command = action
         return action
+
+    def _feedback_reference(
+        self, obs: dict, position: np.ndarray, velocity: np.ndarray, acceleration: np.ndarray
+    ) -> tuple[dict, np.ndarray, np.ndarray, np.ndarray]:
+        """Use the same observation and reference as the trajectory tracker."""
+        return obs, position, velocity, acceleration
 
     def track_reference(self, obs, position, velocity, acceleration=None, yaw=0.0):
         if self._soft_obstacle_clearance:

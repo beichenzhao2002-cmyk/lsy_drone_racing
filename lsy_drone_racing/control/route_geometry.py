@@ -30,9 +30,29 @@ def _obstacle_graph(centers_key, clearance):
     ring = 1.08 * clearance * np.column_stack((np.cos(angles), np.sin(angles)))
     nodes = (centers[:, None] + ring).reshape(-1, 2)
     edge = _edge_geometry(nodes, nodes)
-    distances = _squared_distances_from_edges(nodes, edge, centers)
+    # Reuse two edge-sized work arrays to avoid allocating several full
+    # obstacle-by-edge tensors on each graph cache miss.
+    dx, dy, length_sq, denominator = edge
+    distances = np.empty((len(centers), len(nodes), len(nodes)), dtype=nodes.dtype)
+    projection = np.empty_like(dx)
+    component = np.empty_like(dy)
+    for center, distance in zip(centers, distances, strict=True):
+        ox = (center[0] - nodes[:, 0])[:, None]
+        oy = (center[1] - nodes[:, 1])[:, None]
+        np.multiply(ox, dx, out=projection)
+        np.multiply(oy, dy, out=component)
+        projection += component
+        projection /= denominator
+        np.clip(projection, 0.0, 1.0, out=projection)
+        np.multiply(projection, dx, out=distance)
+        np.subtract(ox, distance, out=distance)
+        np.multiply(projection, dy, out=component)
+        np.subtract(oy, component, out=component)
+        np.square(distance, out=distance)
+        np.square(component, out=component)
+        distance += component
     collisions = distances < max(clearance - 1e-6, 0.) ** 2
-    return nodes, np.sqrt(edge[2]), distances, collisions, collisions.sum(axis=0)
+    return nodes, np.sqrt(length_sq), distances, collisions, collisions.sum(axis=0)
 
 
 def approach_route(
